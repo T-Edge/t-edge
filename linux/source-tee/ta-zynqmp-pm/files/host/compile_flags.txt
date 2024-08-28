@@ -1,0 +1,3 @@
+-I../ta/include
+-I./include
+-I/home/shenjm/petalinux/app/sysroot/recipe-sysroot/usr/include

@@ -1,0 +1,22 @@
+{
+    "files.associations": {
+        "*.conf": "bitbake",
+        "*.inc": "bitbake"
+    },
+    "files.watcherExclude": {
+        "**/.git/objects/**": true,
+        "**/.git/subtree-cache/**": true,
+        "**/.hg/store/**": true,
+        "**/.Xil/**": true,
+        "**/build/**": true,
+        "**/node_modules/*/**": true
+    },
+    "python.analysis.extraPaths": [
+        "${workspaceFolder}/linux/*/components/yocto/layers/core/bitbake/lib",
+        "${workspaceFolder}/linux/*/components/yocto/layers/core/meta/lib",
+    ],
+    "python.autoComplete.extraPaths": [
+        "${workspaceFolder}/linux/*/components/yocto/layers/core/bitbake/lib",
+        "${workspaceFolder}/linux/*/components/yocto/layers/core/meta/lib",
+    ]
+}

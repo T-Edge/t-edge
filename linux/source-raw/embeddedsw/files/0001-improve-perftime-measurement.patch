@@ -1,0 +1,84 @@
+From d3c43806b02d5e962af0c4323797aaeaabcf1bcf Mon Sep 17 00:00:00 2001
+From: Shen Jiamin <shen_jiamin@u.nus.edu>
+Date: Wed, 13 Sep 2023 21:09:00 +0800
+Subject: [PATCH 1/2] improve perftime measurement
+
+---
+ lib/sw_apps/zynqmp_fsbl/src/xfsbl_handoff.c | 24 +++++++++++++++++++++
+ lib/sw_apps/zynqmp_fsbl/src/xfsbl_main.c    |  3 ++-
+ 2 files changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/lib/sw_apps/zynqmp_fsbl/src/xfsbl_handoff.c b/lib/sw_apps/zynqmp_fsbl/src/xfsbl_handoff.c
+index 7c632bd..01fe30a 100644
+--- a/lib/sw_apps/zynqmp_fsbl/src/xfsbl_handoff.c
++++ b/lib/sw_apps/zynqmp_fsbl/src/xfsbl_handoff.c
+@@ -41,6 +41,7 @@
+ #include "xfsbl_main.h"
+ #include "xfsbl_image_header.h"
+ #include "xfsbl_bs.h"
++#include "xuartps_hw.h"
+ 
+ /************************** Constant Definitions *****************************/
+ #define XFSBL_CPU_POWER_UP		(0x1U)
+@@ -551,6 +552,18 @@ void XFsbl_HandoffExit(u64 HandoffAddress, u32 Flags)
+ 	XFsbl_Out32(PMU_GLOBAL_GLOB_GEN_STORAGE5, RegVal);
+ 
+ 	XFsbl_Printf(DEBUG_GENERAL,"Exit from FSBL \n\r");
++#ifdef XFSBL_PERF
++	extern XFsblPs FsblInstance;
++	XFsbl_MeasurePerfTime(FsblInstance.PerfTime.tFsblStart);
++	XFsbl_Printf(DEBUG_PRINT_ALWAYS, ": Total Time from XFsbl_HandoffExit\n\r");
++	XFsbl_Printf(DEBUG_PRINT_ALWAYS, "................................\n\r");
++	XFsbl_Printf(DEBUG_PRINT_ALWAYS, "................................\n\r");
++	while (XUartPs_IsReceiveData(STDOUT_BASEADDRESS))
++	{
++		XUartPs_ReadReg(STDOUT_BASEADDRESS, XUARTPS_FIFO_OFFSET);
++	}
++
++#endif
+ 
+ 	/**
+ 	 * Exit to handoff address
+@@ -804,7 +817,18 @@ u32 XFsbl_Handoff (const XFsblPs * FsblInstancePtr, u32 PartitionNum, u32 EarlyH
+ 	/**
+ 	 * FSBL hook before Handoff
+ 	 */
++
++#ifdef XFSBL_PERF
++	XTime tCur = 0;
++	XTime_GetTime(&tCur);
++#endif
++
+ 	Status = XFsbl_HookBeforeHandoff(EarlyHandoff);
++
++#ifdef XFSBL_PERF
++	XFsbl_MeasurePerfTime(tCur);
++	XFsbl_Printf(DEBUG_PRINT_ALWAYS, ": XFsbl_HookBeforeHandoff \r\n");
++#endif
+ 	if (Status != XFSBL_SUCCESS)
+ 	{
+ 		Status = XFSBL_ERROR_HOOK_BEFORE_HANDOFF;
+diff --git a/lib/sw_apps/zynqmp_fsbl/src/xfsbl_main.c b/lib/sw_apps/zynqmp_fsbl/src/xfsbl_main.c
+index d38f799..4c38220 100644
+--- a/lib/sw_apps/zynqmp_fsbl/src/xfsbl_main.c
++++ b/lib/sw_apps/zynqmp_fsbl/src/xfsbl_main.c
+@@ -238,6 +238,7 @@ int main(void )
+ 						XFsbl_MeasurePerfTime(FsblInstance.PerfTime.tFsblStart);
+ 						XFsbl_Printf(DEBUG_PRINT_ALWAYS, ": Total Time \n\r");
+ 						XFsbl_Printf(DEBUG_PRINT_ALWAYS, "Note: Total execution time includes print times \n\r");
++						XFsbl_Printf(DEBUG_PRINT_ALWAYS, "\n\r");
+ #endif
+ 						FsblStage = XFSBL_STAGE4;
+ 						EarlyHandoff = FsblStatus;
+@@ -580,7 +581,7 @@ void XFsbl_MeasurePerfTime(XTime tCur)
+ 	tPerfMsFrac = tPerfNs % (u64)1e6;
+ 
+ 	/* Print the whole (in ms.) and fractional part */
+-	XFsbl_Printf(DEBUG_PRINT_ALWAYS, "%d.%06d ms.",
++	XFsbl_Printf(DEBUG_PRINT_ALWAYS, "%6d.%06d ms.",
+ 			(u32)tPerfMs, (u32)tPerfMsFrac);
+ }
+ 
+-- 
+2.34.1
+

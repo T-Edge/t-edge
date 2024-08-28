@@ -1,0 +1,421 @@
+From a54104edb1ff21771f54ebd22b16fc214a65acc1 Mon Sep 17 00:00:00 2001
+From: Shen Jiamin <shen_jiamin@comp.nus.edu.sg>
+Date: Fri, 3 Mar 2023 13:18:32 +0800
+Subject: [PATCH 2/2] sign bitstream
+
+---
+ core/arch/arm/kernel/boot.c                   |   6 +
+ core/drivers/zynqmp_pm.c                      | 109 ++++++++++++++++++
+ core/include/crypto/crypto.h                  |   1 +
+ core/include/drivers/zynqmp_pm.h              |  30 +++--
+ core/lib/libtomcrypt/ed25519.c                |  28 ++++-
+ .../libtomcrypt/src/pk/ed25519/ed25519_sign.c |   3 +
+ core/lib/libtomcrypt/src/pk/ed25519/sub.mk    |   1 +
+ core/pta/zynqmp_pm.c                          |  36 ++++--
+ 8 files changed, 193 insertions(+), 21 deletions(-)
+
+diff --git a/core/arch/arm/kernel/boot.c b/core/arch/arm/kernel/boot.c
+index b75a08b3..ee23dce2 100644
+--- a/core/arch/arm/kernel/boot.c
++++ b/core/arch/arm/kernel/boot.c
+@@ -567,8 +567,14 @@ static void init_runtime(unsigned long pageable_part)
+ }
+ #else
+ 
++uint8_t attestation_key[32];
++
+ static void init_runtime(unsigned long pageable_part __unused)
+ {
++	const struct boot_embdata *embdata = (const void *)__end;
++	DMSG("embdata->total_len = 0x%x\n", embdata->total_len);
++	memcpy(attestation_key, (const uint8_t *)__end + sizeof(*embdata), 32);
++
+ 	init_asan();
+ 
+ 	/*
+diff --git a/core/drivers/zynqmp_pm.c b/core/drivers/zynqmp_pm.c
+index 969c2953..bc91e9a7 100644
+--- a/core/drivers/zynqmp_pm.c
++++ b/core/drivers/zynqmp_pm.c
+@@ -6,6 +6,7 @@
+ #include "tee_api_defines.h"
+ #include "trace.h"
+ #include <arm.h>
++#include <crypto/crypto.h>
+ #include <drivers/zynqmp_csudma.h>
+ #include <drivers/zynqmp_pm.h>
+ #include <kernel/cache_helpers.h>
+@@ -32,6 +33,15 @@
+ #define EFUSE_NOT_ENABLED 29
+ #define VERSION_MASK      GENMASK_32(3, 0)
+ 
++extern uint8_t attestation_key[32];
++static uint8_t attestation_key_pub[32];
++
++static struct ed25519_keypair device_key = {
++    .priv = NULL,
++    .pub = NULL,
++    .curve = 0
++};
++
+ /* PMU-FW return status codes */
+ static const char *str_pm_ret_status(uint32_t res)
+ {
+@@ -254,3 +264,102 @@ TEE_Result zynqmp_fpga_load(void *addr, size_t len, uint32_t flags)
+ 
+     return TEE_SUCCESS;
+ }
++
++static TEE_Result sha256(uint8_t *dgst, size_t dgst_len,
++    const uint8_t *msg, size_t msg_len)
++{
++    TEE_Result res;
++    void *ctx = NULL;
++
++    if (!dgst || !msg) {
++        return TEE_ERROR_BAD_PARAMETERS;
++    }
++
++    if (dgst_len < TEE_SHA256_HASH_SIZE) {
++        return TEE_ERROR_SHORT_BUFFER;
++    }
++
++    res = crypto_hash_alloc_ctx(&ctx, TEE_ALG_SHA256);
++    if (res != TEE_SUCCESS) {
++        return res;
++    }
++
++    res = crypto_hash_init(ctx);
++    if (res != TEE_SUCCESS) {
++        goto out;
++    }
++
++    res = crypto_hash_update(ctx, msg, msg_len);
++    if (res != TEE_SUCCESS) {
++        goto out;
++    }
++
++    res = crypto_hash_final(ctx, dgst, dgst_len);
++out:
++    crypto_hash_free_ctx(ctx);
++    return res;
++}
++
++struct attestation_signature {
++    uint8_t hash_nonce[TEE_SHA256_HASH_SIZE];
++    uint8_t hash_message[TEE_SHA256_HASH_SIZE];
++    uint8_t signature[64];
++};
++
++TEE_Result attestation_sign(uint8_t *signature, size_t signature_len,
++    const uint8_t *message, size_t message_len,
++    const uint8_t *nonce, size_t nonce_len)
++{
++    TEE_Result res;
++    struct attestation_signature *sig = (struct attestation_signature *)signature;
++    uint8_t dgst[TEE_SHA256_HASH_SIZE];
++    size_t siglen = sizeof(sig->signature);
++
++    if (!signature || !message || !nonce) {
++        EMSG("Invalid parameters %p %p %p", signature, message, nonce);
++        return TEE_ERROR_BAD_PARAMETERS;
++    }
++
++    if (signature_len < sizeof(struct attestation_signature)) {
++        EMSG("Invalid signature length %zu", signature_len);
++        return TEE_ERROR_SHORT_BUFFER;
++    }
++
++    // prepare attestation key
++    if (device_key.priv == NULL) {
++        device_key.priv = attestation_key;
++        device_key.pub = attestation_key_pub;
++        if ((res = crypto_acipher_import_ed25519_key(&device_key)) != TEE_SUCCESS) {
++            EMSG("Failed to import attestation key");
++            return res;
++        }
++    }
++
++    // dump key
++    DMSG("Attestation key:");
++    DHEXDUMP(device_key.priv, 32);
++    DHEXDUMP(device_key.pub, 32);
++
++    if ((res = sha256(sig->hash_nonce, sizeof(sig->hash_nonce), nonce, nonce_len)) != TEE_SUCCESS) {
++        EMSG("Failed to hash nonce");
++        return res;
++    }
++
++    if ((res = sha256(sig->hash_message, sizeof(sig->hash_message), message, message_len)) != TEE_SUCCESS) {
++        EMSG("Failed to hash buffer");
++        return res;
++    }
++
++    if ((res = sha256(dgst, sizeof(dgst), signature, 2 * TEE_SHA256_HASH_SIZE)) != TEE_SUCCESS) {
++        EMSG("Failed to hash signature");
++        return res;
++    }
++
++    if ((res = crypto_acipher_ed25519_sign(&device_key, dgst, sizeof(dgst), sig->signature, &siglen))
++        != TEE_SUCCESS) {
++        EMSG("Failed to sign buffer");
++        return res;
++    }
++
++    return res;
++}
+diff --git a/core/include/crypto/crypto.h b/core/include/crypto/crypto.h
+index 71a287ec..71939095 100644
+--- a/core/include/crypto/crypto.h
++++ b/core/include/crypto/crypto.h
+@@ -220,6 +220,7 @@ TEE_Result crypto_acipher_gen_x25519_key(struct x25519_keypair *key,
+ 					 size_t key_size);
+ TEE_Result crypto_acipher_gen_ed25519_key(struct ed25519_keypair *key,
+ 					  size_t key_size);
++TEE_Result crypto_acipher_import_ed25519_key(struct ed25519_keypair *key);
+ TEE_Result crypto_acipher_ed25519_sign(struct ed25519_keypair *key,
+ 				       const uint8_t *msg, size_t msg_len,
+ 				       uint8_t *sig, size_t *sig_len);
+diff --git a/core/include/drivers/zynqmp_pm.h b/core/include/drivers/zynqmp_pm.h
+index f6a2800b..5240b7e8 100644
+--- a/core/include/drivers/zynqmp_pm.h
++++ b/core/include/drivers/zynqmp_pm.h
+@@ -16,17 +16,27 @@
+  * (PUF) Support can be found at
+  * https://www.xilinx.com/support/documentation/application_notes/xapp1319-zynq-usp-prog-nvm.pdf
+  */
+-#define ZYNQMP_NONPUF_EFUSE		0
+-#define ZYNQMP_PUF_EFUSE		1
++#define ZYNQMP_NONPUF_EFUSE 0
++#define ZYNQMP_PUF_EFUSE    1
+ 
+ /* List of eFuse identifiers */
+ enum zynqmp_efuse_id {
+-	DNA = 0, IP_DISABLE, USER0, USER1, USER2, USER3, USER4, USER5, USER6,
+-	USER7, MISC_USER_CTRL, SEC_CTRL,
++    DNA = 0,
++    IP_DISABLE,
++    USER0,
++    USER1,
++    USER2,
++    USER3,
++    USER4,
++    USER5,
++    USER6,
++    USER7,
++    MISC_USER_CTRL,
++    SEC_CTRL,
+ };
+ 
+ /* Valid bytes in the eFuse */
+-#define ZYNQMP_EFUSE_LEN(_id)	ZYNQMP_EFUSE_##_id##_LENGTH
++#define ZYNQMP_EFUSE_LEN(_id) ZYNQMP_EFUSE_##_id##_LENGTH
+ 
+ /* Memory required to access the eFuse */
+ #define ZYNQMP_EFUSE_MEM(_id) (ROUNDUP(ZYNQMP_EFUSE_LEN(_id), CACHELINE_LEN))
+@@ -43,8 +53,7 @@ enum zynqmp_efuse_id {
+  * @puf: is eFuse PUF, ZYNQMP_PUF_EFUSE/ZYNQMP_NONPUF_EFUSE
+  * Return a TEE_Result compliant status
+  */
+-TEE_Result zynqmp_efuse_read(uint8_t *buf, size_t buf_sz,
+-			     enum zynqmp_efuse_id id, bool puf);
++TEE_Result zynqmp_efuse_read(uint8_t *buf, size_t buf_sz, enum zynqmp_efuse_id id, bool puf);
+ 
+ /*
+  * Program eFuse memory
+@@ -54,8 +63,7 @@ TEE_Result zynqmp_efuse_read(uint8_t *buf, size_t buf_sz,
+  * @puf: is eFuse PUF, ZYNQMP_PUF_EFUSE/ZYNQMP_NONPUF_EFUSE
+  * Return a TEE_Result compliant status
+  */
+-TEE_Result zynqmp_efuse_write(uint8_t *buf, size_t buf_sz,
+-			      enum zynqmp_efuse_id id, bool puf);
++TEE_Result zynqmp_efuse_write(uint8_t *buf, size_t buf_sz, enum zynqmp_efuse_id id, bool puf);
+ 
+ /*
+  * Read the SoC version number:
+@@ -65,4 +73,8 @@ TEE_Result zynqmp_soc_version(uint32_t *version);
+ 
+ TEE_Result zynqmp_fpga_load(void *addr, size_t len, uint32_t flags);
+ 
++TEE_Result attestation_sign(uint8_t *signature, size_t signature_len,
++    const uint8_t *message, size_t message_len,
++    const uint8_t *nonce, size_t nonce_len);
++
+ #endif /*__DRIVERS_ZYNQMP_PM_H__*/
+diff --git a/core/lib/libtomcrypt/ed25519.c b/core/lib/libtomcrypt/ed25519.c
+index b85629b8..fa94f154 100644
+--- a/core/lib/libtomcrypt/ed25519.c
++++ b/core/lib/libtomcrypt/ed25519.c
+@@ -36,6 +36,24 @@ TEE_Result crypto_acipher_alloc_ed25519_keypair(struct ed25519_keypair *key,
+ 	return TEE_SUCCESS;
+ }
+ 
++TEE_Result crypto_acipher_import_ed25519_key(struct ed25519_keypair *key)
++{
++	curve25519_key ltc_tmp_key = {};
++
++	if (!key || !key->priv || !key->pub) {
++		return TEE_ERROR_BAD_PARAMETERS;
++	}
++
++	if (ed25519_import_raw(key->priv, ED25519_KEY_SIZE >> 3, PK_PRIVATE, &ltc_tmp_key) != CRYPT_OK) {
++		return TEE_ERROR_BAD_PARAMETERS;
++	}
++
++	memcpy(key->pub, ltc_tmp_key.pub, sizeof(ltc_tmp_key.pub));
++	memzero_explicit(&ltc_tmp_key, sizeof(ltc_tmp_key));
++
++	return TEE_SUCCESS;
++}
++
+ TEE_Result crypto_acipher_gen_ed25519_key(struct ed25519_keypair *key,
+ 					  size_t key_size)
+ {
+@@ -63,14 +81,16 @@ TEE_Result crypto_acipher_ed25519_sign(struct ed25519_keypair *key,
+ 				       uint8_t *sig, size_t *sig_len)
+ {
+ 	int err;
+-	unsigned long siglen;
++	unsigned long siglen = *sig_len;
+ 	curve25519_key private_key = {
+ 		.type = PK_PRIVATE,
+ 		.algo = LTC_OID_ED25519,
+ 	};
+ 
+-	if (!key)
++	if (!key){
++		EMSG("key is NULL");
+ 		return TEE_ERROR_BAD_PARAMETERS;
++	}
+ 
+ 	memcpy(private_key.priv, key->priv, sizeof(private_key.priv));
+ 	memcpy(private_key.pub, key->pub, sizeof(private_key.pub));
+@@ -79,8 +99,10 @@ TEE_Result crypto_acipher_ed25519_sign(struct ed25519_keypair *key,
+ 
+ 	memzero_explicit(&private_key, sizeof(private_key));
+ 
+-	if (err != CRYPT_OK)
++	if (err != CRYPT_OK){
++		EMSG("ed25519_sign failed, err = %d", err);
+ 		return TEE_ERROR_BAD_PARAMETERS;
++	}
+ 	*sig_len = siglen;
+ 	return TEE_SUCCESS;
+ }
+diff --git a/core/lib/libtomcrypt/src/pk/ed25519/ed25519_sign.c b/core/lib/libtomcrypt/src/pk/ed25519/ed25519_sign.c
+index d5bf364e..e22dbf30 100644
+--- a/core/lib/libtomcrypt/src/pk/ed25519/ed25519_sign.c
++++ b/core/lib/libtomcrypt/src/pk/ed25519/ed25519_sign.c
+@@ -1,6 +1,7 @@
+ /* LibTomCrypt, modular cryptographic library -- Tom St Denis */
+ /* SPDX-License-Identifier: Unlicense */
+ #include "tomcrypt_private.h"
++#include "trace.h"
+ 
+ /**
+   @file ed25519_shared_secret.c
+@@ -28,6 +29,7 @@ static int s_ed25519_sign(const unsigned char  *msg, unsigned long  msglen,
+ 
+    if (*siglen < 64uL) {
+       *siglen = 64uL;
++      EMSG("siglen too small, siglen = %lu", *siglen);
+       return CRYPT_BUFFER_OVERFLOW;
+    }
+ 
+@@ -120,6 +122,7 @@ int ed25519_sign(const  unsigned char *msg, unsigned long msglen,
+                         unsigned char *sig, unsigned long *siglen,
+                  const curve25519_key *private_key)
+ {
++   DMSG("siglen = %lu", *siglen);
+    return s_ed25519_sign(msg, msglen, sig, siglen, NULL, 0, private_key);
+ }
+ 
+diff --git a/core/lib/libtomcrypt/src/pk/ed25519/sub.mk b/core/lib/libtomcrypt/src/pk/ed25519/sub.mk
+index cb2206da..1c2481ab 100644
+--- a/core/lib/libtomcrypt/src/pk/ed25519/sub.mk
++++ b/core/lib/libtomcrypt/src/pk/ed25519/sub.mk
+@@ -1,6 +1,7 @@
+ srcs-y += ed25519_export.c
+ srcs-y += ed25519_import.c
+ srcs-y += ed25519_import_pkcs8.c
++srcs-y += ed25519_import_raw.c
+ srcs-y += ed25519_import_x509.c
+ srcs-y += ed25519_make_key.c
+ srcs-y += ed25519_sign.c
+diff --git a/core/pta/zynqmp_pm.c b/core/pta/zynqmp_pm.c
+index 38b8484a..ffb91e45 100644
+--- a/core/pta/zynqmp_pm.c
++++ b/core/pta/zynqmp_pm.c
+@@ -1,14 +1,22 @@
+-#include "kernel/tee_misc.h"
+-#include "string.h"
++#include <crypto/crypto.h>
+ #include <drivers/zynqmp_pm.h>
+ #include <kernel/pseudo_ta.h>
++#include <kernel/tee_misc.h>
+ #include <pta_zynqmp_pm.h>
++#include <string.h>
+ #include <tee_api_defines.h>
+ #include <tee_api_types.h>
+ #include <trace.h>
++#include <utee_defines.h>
+ 
+ #define PTA_NAME "zynqmp_pm.pta"
+ 
++struct session_fpga_load {
++    size_t len;
++    size_t off;
++    void *mem;
++} _session;
++
+ static TEE_Result pta_soc_version(uint32_t param_types, TEE_Param params[TEE_NUM_PARAMS])
+ {
+     if (param_types != TEE_PARAM_TYPES(TEE_PARAM_TYPE_VALUE_OUTPUT, TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE)) {
+@@ -18,12 +26,6 @@ static TEE_Result pta_soc_version(uint32_t param_types, TEE_Param params[TEE_NUM
+     return zynqmp_soc_version(&params[0].value.a);
+ }
+ 
+-struct session_fpga_load {
+-    size_t len;
+-    size_t off;
+-    void *mem;
+-} _session;
+-
+ static TEE_Result pta_fpga_load(uint32_t cmd_id, uint32_t param_types, TEE_Param params[TEE_NUM_PARAMS])
+ {
+     if (cmd_id == PTA_CMD_ZYNQMP_FPGA_LOAD_INIT) {
+@@ -55,14 +57,30 @@ static TEE_Result pta_fpga_load(uint32_t cmd_id, uint32_t param_types, TEE_Param
+     }
+ 
+     if (cmd_id == PTA_CMD_ZYNQMP_FPGA_LOAD_PROGRAM) {
+-        if (param_types != TEE_PARAM_TYPES(TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE)) {
++        TEE_Result res;
++
++        if (param_types != TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_MEMREF_OUTPUT, TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE)) {
++            EMSG("Bad parameters");
+             return TEE_ERROR_BAD_PARAMETERS;
+         }
+ 
+         if (_session.len != _session.off) {
++            EMSG("Length mismatch");
+             return TEE_ERROR_BAD_STATE;
+         }
+ 
++        if ((res = attestation_sign(
++                 params[1].memref.buffer,
++                 params[1].memref.size,
++                 _session.mem,
++                 _session.len,
++                 params[0].memref.buffer,
++                 params[0].memref.size))
++            != TEE_SUCCESS) {
++            EMSG("Failed to sign FPGA image");
++            return res;
++        }
++
+         return zynqmp_fpga_load(_session.mem, _session.len, 0);
+     }
+ 
+-- 
+2.34.1
+

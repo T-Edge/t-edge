@@ -1,0 +1,374 @@
+From c65259132e0705d7e26bc903540a3bead5c8e923 Mon Sep 17 00:00:00 2001
+From: Shen Jiamin <shen_jiamin@u.nus.edu>
+Date: Wed, 13 Sep 2023 21:30:08 +0800
+Subject: [PATCH 2/2] add fsbl hook
+
+Signed-off-by: Shen Jiamin <shen_jiamin@u.nus.edu>
+---
+ lib/sw_apps/zynqmp_fsbl/src/xfsbl_hooks.c | 281 ++++++++++++++--------
+ 1 file changed, 185 insertions(+), 96 deletions(-)
+
+diff --git a/lib/sw_apps/zynqmp_fsbl/src/xfsbl_hooks.c b/lib/sw_apps/zynqmp_fsbl/src/xfsbl_hooks.c
+index 80a1314..649a394 100644
+--- a/lib/sw_apps/zynqmp_fsbl/src/xfsbl_hooks.c
++++ b/lib/sw_apps/zynqmp_fsbl/src/xfsbl_hooks.c
+@@ -1,36 +1,44 @@
+ /******************************************************************************
+-* Copyright (c) 2015 - 2020 Xilinx, Inc.  All rights reserved.
+-* SPDX-License-Identifier: MIT
+-******************************************************************************/
+-
++ * Copyright (c) 2015 - 2020 Xilinx, Inc.  All rights reserved.
++ * SPDX-License-Identifier: MIT
++ ******************************************************************************/
+ 
+ /*****************************************************************************/
+ /**
+-*
+-* @file xfsbl_hooks.c
+-*
+-* This is the file which contains FSBL hook functions.
+-*
+-* <pre>
+-* MODIFICATION HISTORY:
+-*
+-* Ver   Who  Date        Changes
+-* ----- ---- -------- -------------------------------------------------------
+-* 1.00  kc   04/21/14 Initial release
+-* 2.0   bv   12/05/16 Made compliance to MISRAC 2012 guidelines
+-*       ssc  03/25/17 Set correct value for SYSMON ANALOG_BUS register
+-*
+-* </pre>
+-*
+-* @note
+-*
+-******************************************************************************/
++ *
++ * @file xfsbl_hooks.c
++ *
++ * This is the file which contains FSBL hook functions.
++ *
++ * <pre>
++ * MODIFICATION HISTORY:
++ *
++ * Ver   Who  Date        Changes
++ * ----- ---- -------- -------------------------------------------------------
++ * 1.00  kc   04/21/14 Initial release
++ * 2.0   bv   12/05/16 Made compliance to MISRAC 2012 guidelines
++ *       ssc  03/25/17 Set correct value for SYSMON ANALOG_BUS register
++ *
++ * </pre>
++ *
++ * @note
++ *
++ ******************************************************************************/
+ /***************************** Include Files *********************************/
+-#include "xfsbl_hw.h"
+ #include "xfsbl_hooks.h"
+ #include "psu_init.h"
++#include "xfsbl_authentication.h"
++#include "xfsbl_debug.h"
++#include "xfsbl_hw.h"
++#include "xfsbl_main.h"
++#include "xfsbl_misc.h"
++#include "xil_types.h"
++
+ /************************** Constant Definitions *****************************/
+ 
++#define ATTESTATION_SECRET_SIZE                                                \
++    (XFSBL_HASH_TYPE_SHA3 + XSECURE_SECURE_GCM_TAG_SIZE)
++
+ /**************************** Type Definitions *******************************/
+ 
+ /***************** Macros (Inline Functions) Definitions *********************/
+@@ -38,41 +46,123 @@
+ /************************** Function Prototypes ******************************/
+ 
+ /************************** Variable Definitions *****************************/
++
++extern XFsblPs FsblInstance;
++
+ #ifdef XFSBL_BS
+-u32 XFsbl_HookBeforeBSDownload(void )
++u32 XFsbl_HookBeforeBSDownload(void)
+ {
+-	u32 Status = XFSBL_SUCCESS;
++    u32 Status = XFSBL_SUCCESS;
++    XFsbl_Printf(DEBUG_GENERAL, "=== [[ %s ]] ===\r\n", __FUNCTION__);
+ 
+-	/**
+-	 * Add the code here
+-	 */
++    /* Add the code here */
+ 
+-
+-	return Status;
++    return Status;
+ }
+ 
+-
+-u32 XFsbl_HookAfterBSDownload(void )
++u32 XFsbl_HookAfterBSDownload(void)
+ {
+-	u32 Status = XFSBL_SUCCESS;
++    u32 Status = XFSBL_SUCCESS;
++    XFsbl_Printf(DEBUG_GENERAL, "=== [[ %s ]] ===\r\n", __FUNCTION__);
+ 
+-	/**
+-	 * Add the code here
+-	 */
++    /* Add the code here */
+ 
+-	return Status;
++    return Status;
+ }
+ #endif
+ 
+-u32 XFsbl_HookBeforeHandoff(u32 EarlyHandoff)
++static u32 measure_partitions(u8 measurement[XFSBL_HASH_TYPE_SHA3])
+ {
+-	u32 Status = XFSBL_SUCCESS;
++    u32 Status = XFSBL_SUCCESS;
++
++    const XFsblPs_PartitionHeader *header =
++        &FsblInstance.ImageHeader.PartitionHeader[5];
++    u8 *partition_data = (void *)header->DestinationLoadAddress;
++    u32 partition_size = header->TotalDataWordLength * 4;
+ 
+-	/**
+-	 * Add the code here
+-	 */
++    XFsbl_ShaDigest(partition_data, partition_size, measurement,
++                    XFSBL_HASH_TYPE_SHA3);
+ 
+-	return Status;
++    return Status;
++}
++
++static u32 key_derivation(u8 measurement[XFSBL_HASH_TYPE_SHA3],
++                          u8 attestation_key[XFSBL_HASH_TYPE_SHA3])
++{
++    u32 Status = XFSBL_SUCCESS;
++    XSecure_Aes SecureAes;
++    u8 attestation_secret[ATTESTATION_SECRET_SIZE];
++
++    u32 FsblIv[XIH_BH_IV_LENGTH / 4U] = {
++        [0] = XFsbl_In32(EFUSE_BASEADDR + 0x000000100C),
++        [1] = XFsbl_In32(EFUSE_BASEADDR + 0x0000001010),
++        [2] = XFsbl_In32(EFUSE_BASEADDR + 0x0000001014),
++        [3] = 0};
++
++    Status = XSecure_AesInitialize(&SecureAes, &CsuDma,
++                                   XSECURE_CSU_AES_KEY_SRC_DEV, FsblIv, NULL);
++    if (Status != XST_SUCCESS) {
++        XFsbl_Printf(DEBUG_GENERAL, "XSecure_AesInitialize failed\r\n");
++        return Status;
++    }
++
++    Status = XSecure_AesEncryptData(&SecureAes, attestation_secret, measurement,
++                                    XFSBL_HASH_TYPE_SHA3);
++    if (Status != XST_SUCCESS) {
++        XFsbl_Printf(DEBUG_GENERAL, "XSecure_AesEncryptData failed\r\n");
++        return Status;
++    }
++    XSecure_AesReset(&SecureAes);
++
++    XFsbl_PrintArray(DEBUG_DETAILED, (u8 *)FsblIv, XIH_BH_IV_LENGTH,
++                     "FsblIv");
++    XFsbl_PrintArray(DEBUG_DETAILED, attestation_secret,
++                     ATTESTATION_SECRET_SIZE, "derivation");
++
++    XFsbl_ShaDigest(attestation_secret, ATTESTATION_SECRET_SIZE,
++                    attestation_key, XFSBL_HASH_TYPE_SHA3);
++
++    return Status;
++}
++
++u32 XFsbl_HookBeforeHandoff(u32 EarlyHandoff)
++{
++    u32 Status = XFSBL_SUCCESS;
++    u8 measurement[XFSBL_HASH_TYPE_SHA3];
++    u8 attestation_key[XFSBL_HASH_TYPE_SHA3];
++
++    XFsbl_Printf(DEBUG_GENERAL, "=== [[ %s ]] ===\r\n", __FUNCTION__);
++
++    XFsbl_Printf(DEBUG_GENERAL, "NoOfPartitions: %d\r\n",
++                 FsblInstance.ImageHeader.ImageHeaderTable.NoOfPartitions);
++
++    // measure partitions
++    Status = measure_partitions(measurement);
++    if (Status != XFSBL_SUCCESS) {
++        XFsbl_Printf(DEBUG_GENERAL, "measure_partitions failed\r\n");
++        return Status;
++    }
++    XFsbl_PrintArray(DEBUG_DETAILED, measurement, XFSBL_HASH_TYPE_SHA3,
++                     "measurement");
++
++    // derive attestation key
++    Status = key_derivation(measurement, attestation_key);
++    if (Status != XFSBL_SUCCESS) {
++        XFsbl_Printf(DEBUG_GENERAL, "key_derivation failed\r\n");
++        return Status;
++    }
++    XFsbl_PrintArray(DEBUG_DETAILED, attestation_key + 16, 32,
++                     "attestation_key");
++
++    // write attestation key to optee core
++    const XFsblPs_PartitionHeader *header =
++        &FsblInstance.ImageHeader.PartitionHeader[5];
++    u8 *base = (u8 *)header->DestinationLoadAddress +
++                    header->TotalDataWordLength * 4;
++    XFsbl_MemCpy(base, attestation_key + 16, 32);
++    XFsbl_Out32((UINTPTR)base - 0x18, 0x18 + 32);
++
++    return Status;
+ }
+ 
+ /*****************************************************************************/
+@@ -84,17 +174,16 @@ u32 XFsbl_HookBeforeHandoff(u32 EarlyHandoff)
+  *
+  * @return error status based on implemented functionality (SUCCESS by default)
+  *
+-  *****************************************************************************/
++ *****************************************************************************/
+ 
+ u32 XFsbl_HookBeforeFallback(void)
+ {
+-	u32 Status = XFSBL_SUCCESS;
++    u32 Status = XFSBL_SUCCESS;
++    XFsbl_Printf(DEBUG_GENERAL, "=== [[ %s ]] ===\r\n", __FUNCTION__);
+ 
+-	/**
+-	 * Add the code here
+-	 */
++    /* Add the code here */
+ 
+-	return Status;
++    return Status;
+ }
+ 
+ /*****************************************************************************/
+@@ -108,50 +197,50 @@ u32 XFsbl_HookBeforeFallback(void)
+  *
+  * @return error status based on implemented functionality (SUCCESS by default)
+  *
+-  *****************************************************************************/
++ *****************************************************************************/
+ 
+ u32 XFsbl_HookPsuInit(void)
+ {
+-	u32 Status;
++    u32 Status;
+ #ifdef XFSBL_ENABLE_DDR_SR
+-	u32 RegVal;
++    u32 RegVal;
+ #endif
++    XFsbl_Printf(DEBUG_GENERAL, "=== [[ %s ]] ===\r\n", __FUNCTION__);
+ 
+-	/* Add the code here */
++    /* Add the code here */
+ 
+ #ifdef XFSBL_ENABLE_DDR_SR
+-	/* Check if DDR is in self refresh mode */
+-	RegVal = Xil_In32(XFSBL_DDR_STATUS_REGISTER_OFFSET) &
+-		DDR_STATUS_FLAG_MASK;
+-	if (RegVal) {
+-		Status = (u32)psu_init_ddr_self_refresh();
+-	} else {
+-		Status = (u32)psu_init();
+-	}
++    /* Check if DDR is in self refresh mode */
++    RegVal = Xil_In32(XFSBL_DDR_STATUS_REGISTER_OFFSET) & DDR_STATUS_FLAG_MASK;
++    if (RegVal) {
++        Status = (u32)psu_init_ddr_self_refresh();
++    } else {
++        Status = (u32)psu_init();
++    }
+ #else
+-	Status = (u32)psu_init();
++    Status = (u32)psu_init();
+ #endif
+ 
+-	if (XFSBL_SUCCESS != Status) {
+-			XFsbl_Printf(DEBUG_GENERAL,"XFSBL_PSU_INIT_FAILED\n\r");
+-			/**
+-			 * Need to check a way to communicate both FSBL code
+-			 * and PSU init error code
+-			 */
+-			Status = XFSBL_PSU_INIT_FAILED + Status;
+-	}
+-
+-	/**
+-	 * PS_SYSMON_ANALOG_BUS register determines mapping between SysMon supply
+-	 * sense channel to SysMon supply registers inside the IP. This register
+-	 * must be programmed to complete SysMon IP configuration.
+-	 * The default register configuration after power-up is incorrect.
+-	 * Hence, fix this by writing the correct value - 0x3210.
+-	 */
+-
+-	XFsbl_Out32(AMS_PS_SYSMON_ANALOG_BUS, PS_SYSMON_ANALOG_BUS_VAL);
+-
+-	return Status;
++    if (XFSBL_SUCCESS != Status) {
++        XFsbl_Printf(DEBUG_GENERAL, "XFSBL_PSU_INIT_FAILED\n\r");
++        /**
++         * Need to check a way to communicate both FSBL code
++         * and PSU init error code
++         */
++        Status = XFSBL_PSU_INIT_FAILED + Status;
++    }
++
++    /**
++     * PS_SYSMON_ANALOG_BUS register determines mapping between SysMon supply
++     * sense channel to SysMon supply registers inside the IP. This register
++     * must be programmed to complete SysMon IP configuration.
++     * The default register configuration after power-up is incorrect.
++     * Hence, fix this by writing the correct value - 0x3210.
++     */
++
++    XFsbl_Out32(AMS_PS_SYSMON_ANALOG_BUS, PS_SYSMON_ANALOG_BUS_VAL);
++
++    return Status;
+ }
+ 
+ /*****************************************************************************/
+@@ -169,23 +258,23 @@ u32 XFsbl_HookPsuInit(void)
+ #ifdef ENABLE_POS
+ u32 XFsbl_HookGetPosBootType(void)
+ {
+-	u32 WarmBoot = 0;
+-	u32 RegValue = 0;
++    u32 WarmBoot = 0;
++    u32 RegValue = 0;
+ 
+-	do {
+-		RegValue = XFsbl_In32(PMU_GLOBAL_GLOB_GEN_STORAGE1);
+-	} while (0U == RegValue);
++    do {
++        RegValue = XFsbl_In32(PMU_GLOBAL_GLOB_GEN_STORAGE1);
++    } while (0U == RegValue);
+ 
+-	/* Clear Gen Storage register so it can be used later in system */
+-	XFsbl_Out32(PMU_GLOBAL_GLOB_GEN_STORAGE1, 0U);
++    /* Clear Gen Storage register so it can be used later in system */
++    XFsbl_Out32(PMU_GLOBAL_GLOB_GEN_STORAGE1, 0U);
+ 
+-	WarmBoot = RegValue - 1;
++    WarmBoot = RegValue - 1;
+ 
+-	/* Confirm detection in case of resume from Power Off Suspend */
+-	if (0 != RegValue) {
+-		XFsbl_Out32(PMU_GLOBAL_GLOB_GEN_STORAGE2, 1U);
+-	}
++    /* Confirm detection in case of resume from Power Off Suspend */
++    if (0 != RegValue) {
++        XFsbl_Out32(PMU_GLOBAL_GLOB_GEN_STORAGE2, 1U);
++    }
+ 
+-	return WarmBoot;
++    return WarmBoot;
+ }
+ #endif
+-- 
+2.34.1
+

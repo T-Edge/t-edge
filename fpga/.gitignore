@@ -1,0 +1,3 @@
+*.xsa
+conv_filter_hls
+conv_filter_hw
